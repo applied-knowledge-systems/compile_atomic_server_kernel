@@ -1,0 +1,60 @@
+VERSION 0.7
+tar2ext4:
+    FROM golang:alpine
+    WORKDIR src
+    GIT CLONE https://github.com/microsoft/hcsshim .
+    RUN go build ./cmd/tar2ext4
+
+    SAVE ARTIFACT tar2ext4
+
+kernel:
+    FROM alpine:3.16
+    RUN wget https://s3.amazonaws.com/spec.ccfc.min/img/hello/kernel/hello-vmlinux.bin -O kernel.bin
+    SAVE ARTIFACT kernel.bin
+
+rootfs:
+    FROM earthly/dind
+
+    COPY +tar2ext4/tar2ext4 /usr/bin/tar2ext4
+
+    WORKDIR imgbuild
+    
+    WITH DOCKER --load my-build:latest=+test-image
+        RUN docker save my-build:latest > image.tar
+    END
+
+    RUN mkdir image rootfs && tar -xf image.tar -C image
+
+    FOR layer IN $(jq -r '.[].Layers | @sh' ./image/manifest.json | tr -d \')
+        RUN tar -xf ./image/$layer -C rootfs
+    END
+
+    WORKDIR rootfs
+    RUN mkdir -pv rootfs/{sbin,dev,proc,run,sys,var} && \
+        tar -cf ../rootfs.tar *
+    
+    WORKDIR /imgbuild
+
+    RUN tar2ext4 -i rootfs.tar -o rootfs.ext4 && \
+        tune2fs -O ^read-only rootfs.ext4 && \
+        dd if=/dev/zero bs=50M seek=1 count=0 of=rootfs.ext4 && \
+        resize2fs rootfs.ext4 50M
+
+    SAVE ARTIFACT rootfs.ext4
+
+test-image:
+    FROM alpine:3.16
+    RUN apk update && \
+        apk upgrade && \
+        apk add openrc neofetch --no-cache
+    RUN rm -f /sbin/init && ln -sf /usr/bin/neofetch /sbin/init
+
+firecracker:
+    FROM alpine:3.16
+    WORKDIR artifacts
+
+    COPY +rootfs/rootfs.ext4 .
+    COPY +kernel/kernel.bin .
+
+    SAVE ARTIFACT rootfs.ext4 AS LOCAL rootfs.ext4
+    SAVE ARTIFACT kernel.bin AS LOCAL kernel.bin
